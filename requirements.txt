@@ -1,0 +1,4 @@
+litellm==1.51.2
+pydantic==2.9.2
+chromadb==0.5.3
+typer==0.12.5
