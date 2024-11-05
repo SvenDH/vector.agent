@@ -11,7 +11,7 @@ type_map = {
     type(None): "null",
 }
 
-def function_to_json(func) -> dict:
+def func2json(func) -> dict:
     try:
         signature = inspect.signature(func)
     except ValueError as e:
