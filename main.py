@@ -14,6 +14,7 @@ import litellm
 import chromadb
 import typer
 
+from graph import extract_graph
 from util import func2json, split
 
 load_dotenv(override=True)
@@ -43,7 +44,7 @@ class Agent(BaseModel):
             messages = [{"content": dedent(system).strip(), "role": "system"}] + messages
             result = await litellm.acompletion(agent.model, messages, tools=[func2json(f) for f in tools.values()] or None, **self.kwargs)
             message = result.choices[0].message
-            self.messages.append({"name": agent.name, **message.model_dump()})
+            agent.messages.append({"name": agent.name, **message.model_dump()})
             if not message.tool_calls: break
             for c in message.tool_calls:
                 try:
@@ -55,9 +56,9 @@ class Agent(BaseModel):
                 except Exception as e:
                     print(f"Error: {e}")
                     result = Result(value=f"Error: {e}")
-                self.messages.append({"role": "tool", "tool_call_id": c.id, "tool_name": c.function.name, "content": result.value})
+                agent.messages.append({"role": "tool", "tool_call_id": c.id, "tool_name": c.function.name, "content": result.value})
                 if result.agent: agent = result.agent
-        return Response(messages=self.messages[n:], agent=agent)
+        return Response(messages=agent.messages[n:], agent=agent)
 
     def reset(self): self.messages = []
 
@@ -220,35 +221,7 @@ Please analyze the passage and create notes on the key points that are relevant 
 If the passage is part of acknowledgments, table of content, references, prewords, about the author, etc., you can skip it.
 Also give me a summary of the notes take. If the passage does not contain any relevant information, you can skip it.
 """
-
-async def analyze_text(passage: str) -> str:
-    print(f"\033[90m=============\nPassage:\n{passage}\n===============\033[0m")
-    chat = Chat(agents=agents, selector="roundrobin", max_round=12)
-    return (await chat.run(
-        TEXT_ANALYSIS_PROMPT.format(", ".join([a.name for a in agents]), passage).strip(),
-        summary_method="reflection"
-    )).value
-
-analyer = Agent(
-    name="Analyzer",
-    #model="gpt-4o",
-    temperature=0.0,
-    system="""
-    You are an expert text analyzer and a master of information extraction.
-    You are given a passage from a book to analyze.
-    You direct pieces of the text to the experts for analysis by calling the "analyze_text" tool.
-    If the passage is part of acknowledgments, table of content, introductions, references, prewords, about the author, etc., you can skip it.
-    When no more notes have to be taken on the passage or you want to skip, answer with a single "FINISHED".
-    """,
-    functions=[analyze_text]
-)
-
-PASSAGE_PROMPT = """
-The passage is from: {}
-
-The passage is as follows:
-{}
-"""
+chat = Chat(agents=agents, selector="roundrobin", max_round=12)
 
 app = typer.Typer()
 
@@ -258,12 +231,12 @@ def run():
         print(i, file[:-9])
         texts = docs.get(where={"file": file})
         part = ""
-        chat = Chat(agents=[analyer], max_round=10)
         for t, _ in sorted(zip(texts["documents"], texts["metadatas"]), key=lambda x: x[1]["index"]):
             part += t + "\n\n"
             if len(part) > 10000:
-                asyncio.run(chat.run(PASSAGE_PROMPT.format(file[:-9], part)))
-                chat.reset()
+                #asyncio.run(chat.run(PASSAGE_PROMPT.format(file[:-9], part)))
+                #chat.reset()
+                print(asyncio.run(extract_graph(part)))
                 part = ""
 
 
