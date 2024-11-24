@@ -1,119 +1,22 @@
-import json
 import os
 import asyncio
-import random
-import copy
 from uuid import uuid4
-from typing import Callable
 from datetime import datetime
-from textwrap import dedent
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
-import litellm
 import chromadb
 import typer
+import litellm
+import instructor
 
-from graph import extract_graph
-from util import func2json, split
+from agent import Agent, Chat
+from graph import KnowledgeGraph
+from util import split
 
 load_dotenv(override=True)
 # Monkey patch for ollama chat
 #def _token_counter(**kwargs): return 0
 #litellm.token_counter = _token_counter
-
-class Agent(BaseModel):
-    name: str = "agent"
-    model: str = "gpt-4o-mini"
-    system: str | Callable[[], str] = "You are a helpful agent."
-    functions: list[Callable] = []
-    messages: list[dict] = []
-    transforms: list[Callable] = []
-    kwargs: dict = {}
-
-    def __hash__(self): return hash(self.name)
-    
-    async def respond(self, messages: list, max_turns: int = float("inf"), system_prompt: str | None = None) -> 'Response':
-        self.messages.extend([{**h, "role": "user"} for h in messages])
-        agent, n = self, len(self.messages)
-        while len(self.messages) - n < max_turns and agent:
-            tools = {f.__name__: f for f in agent.functions}
-            system = system_prompt or (agent.system() if callable(agent.system) else agent.system)
-            messages = copy.deepcopy(self.messages)
-            for t in self.transforms: messages = t(messages)
-            messages = [{"content": dedent(system).strip(), "role": "system"}] + messages
-            result = await litellm.acompletion(agent.model, messages, tools=[func2json(f) for f in tools.values()] or None, **self.kwargs)
-            message = result.choices[0].message
-            agent.messages.append({"name": agent.name, **message.model_dump()})
-            if not message.tool_calls: break
-            for c in message.tool_calls:
-                try:
-                    raw_result = await tools[c.function.name](**json.loads(c.function.arguments))
-                    match raw_result:
-                        case Result() as result: result = raw_result
-                        case Agent() as agent: result = Result(value=json.dumps({"assistant": agent.name}), agent=agent)
-                        case _: result = Result(value=str(raw_result))
-                except Exception as e:
-                    print(f"Error: {e}")
-                    result = Result(value=f"Error: {e}")
-                agent.messages.append({"role": "tool", "tool_call_id": c.id, "tool_name": c.function.name, "content": result.value})
-                if result.agent: agent = result.agent
-        return Response(messages=agent.messages[n:], agent=agent)
-
-    def reset(self): self.messages = []
-
-class Response(BaseModel):
-    messages: list = []
-    agent: Agent | None = None
-
-class Result(BaseModel):
-    value: str = ""
-    agent: Agent | None = None
-
-class Chat(BaseModel):
-    messages: list[Response] = []
-    agents: list[Agent] = []
-    manager: Agent | None = None
-    speaker: Agent | None = None
-    selector: str = "auto"
-    max_turns: int = float("inf")
-    termination: Callable = Field(default=lambda m: "FINISHED" in m[-1]["content"])
-
-    async def run(self, input: str, summary_method: str = "last_msg", **kwargs) -> Result:
-        if not self.speaker: self.speaker = self.agents[0]
-        if not self.manager: self.manager = Agent(name="Groupchat_Manager", system="You are the manager of the conversation.")
-        turns = 0
-        agents = {a: [{"role": "user", "content": input}] for a in self.agents}
-        while len(agents) > 0 and turns < self.max_turns:
-            self.messages.append(await self.speaker.respond(agents[self.speaker], **kwargs))
-            print(f'{self.speaker.name}: {self.messages[-1].messages[-1]["content"]}')
-            for a in agents: agents[a].append(self.messages[-1].messages[-1])
-            agents[self.speaker] = []
-            last_speaker = self.speaker
-            self.speaker = await self.next_agent([m.messages[-1] for m in self.messages], list(agents.keys()), self.speaker, self.selector)
-            if self.termination(self.messages[-1].messages) and last_speaker in agents:
-                del agents[last_speaker]
-            turns += 1
-        return Result(value=await self.summarize([m.messages[-1] for m in self.messages], summary_method))
-
-    def reset(self):
-        self.messages = []
-        for agent in self.agents: agent.reset()
-
-    async def next_agent(self, messages: list[dict], agents: list[Agent], current: Agent, selector: str = "auto") -> Agent:
-        match selector:
-            case "random": return random.choice(agents)
-            case "delegate": return self.messages[-1].agent or agents[0]
-            case "roundrobin": return agents[(agents.index(current) + 1) % len(agents)]
-            case _: return (await self.manager.respond(messages, max_turns=1)).agent or agents[0]
-        
-    async def summarize(self, messages: list[dict], summary_method: str) -> str:
-        if summary_method == "last_msg":
-            return messages[-1]["content"]
-        elif summary_method == "reflection":
-            result = await self.manager.respond(
-                messages, 1, "Summarize the takeaway from the conversation. Do not add any introductory phrases.")
-            return result.messages[-1]["content"]
 
 
 db = chromadb.PersistentClient(path="db")
@@ -221,24 +124,76 @@ Please analyze the passage and create notes on the key points that are relevant 
 If the passage is part of acknowledgments, table of content, references, prewords, about the author, etc., you can skip it.
 Also give me a summary of the notes take. If the passage does not contain any relevant information, you can skip it.
 """
+
+
+import openai
+llm = instructor.from_openai(openai.AsyncOpenAI(), mode=instructor.Mode.JSON_SCHEMA)
+llm = instructor.from_litellm(litellm.acompletion, mode=instructor.Mode.JSON_SCHEMA, base_url=os.getenv("OPENAI_BASE_URL"))
+
+mem = KnowledgeGraph(llm, db) #, model="ollama_chat/llama3.1")
+mem.custom_prompt = "If the passage is part of acknowledgments, table of content, references, prewords, about the author, etc., you can skip it."
+
 chat = Chat(agents=agents, selector="roundrobin", max_round=12)
 
 app = typer.Typer()
 
 @app.command()
 def run():
+    seen = set([(m["file"], m.get("index", 0)) for m in asyncio.run(mem.get_all(limit=1000000))])
     for i, file in enumerate(os.listdir("data")):
-        print(i, file[:-9])
         texts = docs.get(where={"file": file})
-        part = ""
-        for t, _ in sorted(zip(texts["documents"], texts["metadatas"]), key=lambda x: x[1]["index"]):
-            part += t + "\n\n"
-            if len(part) > 10000:
-                #asyncio.run(chat.run(PASSAGE_PROMPT.format(file[:-9], part)))
-                #chat.reset()
-                print(asyncio.run(extract_graph(part)))
-                part = ""
+        last = ""
+        for t, m in sorted(zip(texts["documents"], texts["metadatas"]), key=lambda x: x[1]["index"]):
+            if (file, m["index"]) in seen: continue
+            print(t)
+            #asyncio.run(chat.run(PASSAGE_PROMPT.format(file[:-9], part)))
+            #chat.reset()
+            while True:
+                try:
+                    print(asyncio.run(mem.add(last + " " + t, filters={"index": m["index"], "file": file})))
+                    break
+                except Exception as e:
+                    print(e)
+            last = t
 
+@app.command()
+def show():
+    import networkx as nx
+    import matplotlib.pyplot as plt
+
+    G = asyncio.run(mem.get_graph())
+    
+    degree_cent = nx.degree_centrality(G)
+    most_connected = sorted(degree_cent.items(), key=lambda x: x[1], reverse=True)
+    top_node_ids = [n for n, _ in most_connected[:25]]
+    top_neighbor_ids = set([n for n, _ in most_connected[:120]])
+    
+    neighbors = set()
+    for node in top_node_ids:
+        neighbors.update(set(G.neighbors(node)) & top_neighbor_ids)
+    
+    subgraph = G.subgraph(set(top_node_ids) | neighbors)
+
+    pos = nx.spring_layout(subgraph, k=1, iterations=50)
+    nx.draw_networkx_edges(subgraph, pos, alpha=0.2)
+    nx.draw_networkx_nodes(subgraph, pos,
+                          node_color='lightgray')
+    nx.draw_networkx_nodes(subgraph, pos,
+                          nodelist=top_node_ids,
+                          node_color='gray')
+    
+    labels = {}
+    for node in subgraph.nodes():
+        if node in top_node_ids:
+            labels[node] = f"{node}\n(deg: {degree_cent[node]})"
+        else:
+            labels[node] = str(node)
+    
+    nx.draw_networkx_labels(subgraph, pos, font_size=6)
+
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
 
 @app.command()
 def fill():
@@ -254,11 +209,146 @@ def fill():
 @app.command()
 def query(query: str):
     #print(query_documents(query))
-    print(retrieve_notes(query))
+    print("\n".join([f"{r['source'].replace('_', ' ')} {r['relation'].replace('_', ' ').upper()} {r['destination'].replace('_', ' ')}" for r in asyncio.run(mem.search(query))]))
+
+@app.command()
+def stats():
+    import networkx as nx
+    G = asyncio.run(mem.get_graph())
+
+    print("Entities:", len(G.nodes))
+    print("Relations:", len(G.edges))
+    print("Components:", [len(c) for c in sorted(nx.weakly_connected_components(G), key=len, reverse=True)])
+
+    types = [n.get("type", "entity") for n in asyncio.run(mem.get_all_nodes())]
+    print("Types:", sorted(set(types), key=types.count, reverse=True))
+
+    relations = [r["relation"] for r in asyncio.run(mem.get_all())]
+    print("Relations:", sorted(set(relations), key=lambda x: relations.count(x), reverse=True))
+
+@app.command()
+def cleanup():
+    from collections import defaultdict
+    import networkx as nx
+
+    print("REMOVE NODES WITH NONE DOCUMENT")
+    nodes = mem.nodes.get()
+    ids_to_delete = [id for id, n in zip(nodes["ids"], nodes["documents"]) if n is None]
+    if ids_to_delete: mem.nodes.delete(ids=ids_to_delete)
+    print(f"Deleted {len(ids_to_delete)} nodes with None document.")
+
+    print("REMOVE DANGLING NODES")
+    relations = mem.relations.get(include=["metadatas"])["metadatas"]
+    rel_nodes = set([r["source"] for r in relations] + [r["destination"] for r in relations])
+    ids_to_delete = []
+    nodes = mem.nodes.get(include=["metadatas"])
+    for id, n in zip(nodes["ids"], nodes["metadatas"]):
+        if n["name"] not in rel_nodes:
+            print(f"Removing dangling node: {n['name']}")
+            ids_to_delete.append(id)
+    if ids_to_delete: mem.nodes.delete(ids=ids_to_delete)
+    print(f"Deleted {len(ids_to_delete)} dangling nodes.")
+    
+    nodes = set([n["name"] for n in mem.nodes.get(include=["metadatas"])["metadatas"]])
+    ids_to_delete = []
+    rels = mem.relations.get(include=["metadatas"])
+    for id, r in zip(rels["ids"], rels["metadatas"]):
+        if r["source"] not in nodes or r["destination"] not in nodes:
+            print(f"Removing dangling relation: {id}")
+            ids_to_delete.append(id)
+    if ids_to_delete: mem.relations.delete(ids=ids_to_delete)
+    print(f"Deleted {len(ids_to_delete)} dangling relations.")
+
+    print("REMOVE SELF CONNECTED RELATIONS")
+    ids_to_delete = []
+    rels = mem.relations.get(include=["metadatas"])
+    for id, r in zip(rels["ids"], rels["metadatas"]):
+        if r["source"] == r["destination"]:
+            print(f"Removing self connected relation: {id}")
+            ids_to_delete.append(id)
+    if ids_to_delete: mem.relations.delete(ids=ids_to_delete)
+    print(f"Deleted {len(ids_to_delete)} self connected relations.")
+
+    print("REMOVE DUPLICATE RELATIONS")
+    edge_counts = defaultdict(list)
+    rels = mem.relations.get(include=["metadatas"])
+    for id, r in zip(rels["ids"], rels["metadatas"]):
+        edge_counts[(r["source"], r["destination"])] += [id]
+    ids_to_delete = [r for rel in edge_counts.values() for r in rel[1:]]
+    if ids_to_delete: mem.relations.delete(ids=ids_to_delete)
+    print(f"Deleted {len(ids_to_delete)} duplicate relations.")
+
+    print("REMOVE LONG NODES")
+    relations = asyncio.run(mem.get_all(limit=100000))
+    nodes = set([r["source"] for r in relations] + [r["destination"] for r in relations])
+    for n in nodes:
+        if len(n) > 35:
+            asyncio.run(mem.remove_node(n))
+        else:
+            new = n.strip("_").replace("'", "").replace('"', "").replace(",", "")\
+                .replace("'", "").replace(";", "").replace("\n", "")\
+                    .removeprefix("the_").removeprefix("a_")
+            if new != n:
+                print(n, "->", new)
+                asyncio.run(mem.merge_nodes(new, n))
+
+    print("MERGE SIMILAR NODES")
+    chunk_size = 100
+    limit = 100
+    threshold = 0.09
+    while True:
+        pairs = set()
+        nodes = mem.nodes.get(include=["documents"])["documents"]
+        for i in range(0, len(nodes), chunk_size):
+            chunk_pairs = mem.nodes.query(query_texts=nodes[i:i + chunk_size], n_results=2, include=["documents", "distances"])
+            pairs.update([(*sorted([p[0], p[1]]), d[1]) for p, d in zip(chunk_pairs["documents"], chunk_pairs["distances"]) if len(d) > 1 and p[1] is not None and d[1] < threshold])
+            if len(pairs) >= limit: break
+        pairs = list(sorted(pairs, key=lambda x: x[2], reverse=True))
+        if not pairs: break
+        print(pairs)
+        for pair in pairs:
+            pair = list(pair)
+            if (pair[0] != pair[1]+"s" and len(pair[0]) > len(pair[1])):
+                temp = pair[0]
+                pair[0] = pair[1]
+                pair[1] = temp
+
+            print(pair[1], "->", pair[0])
+            asyncio.run(mem.merge_nodes(pair[0], pair[1]))
+    
+    print("REMOVE SINGLETONS")
+    G = asyncio.run(mem.get_graph())
+    for comp in nx.weakly_connected_components(G):
+        if len(comp) <= 2:
+            for node in comp:
+                print(node)
+                asyncio.run(mem.remove_node(node))
+
+@app.command()
+def delete_lose_components():
+    import networkx as nx
+    G = asyncio.run(mem.get_graph())
+    for c in list(sorted(nx.weakly_connected_components(G), key=len, reverse=True))[1:2]:
+        for node in c:
+            print(node)
+            #asyncio.run(mem.remove_node(node))
+
+@app.command()
+def remove(entity: str):
+    asyncio.run(mem.remove_node(entity))
+
+@app.command()
+def merge(entity: str, into: str):
+    asyncio.run(mem.merge_nodes(into, entity))
 
 @app.command()
 def clear():
-    db.delete_collection("notes")
+    asyncio.run(mem.delete_all())
+
+@app.command()
+def dump():
+    import json
+    print(json.dumps(asyncio.run(mem.dump())))
 
 if __name__ == "__main__":
     app()

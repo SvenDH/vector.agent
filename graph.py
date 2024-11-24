@@ -1,233 +1,253 @@
-from pydantic import BaseModel, Field, create_model
-import litellm
+import json
 
-class Node(BaseModel):
-    id: str
-    type: str = "Node"
-    properties: dict = Field(default_factory=dict)
+import chromadb
+from pydantic import BaseModel, Field
 
-class Relationship(BaseModel):
-    source: Node
-    target: Node
-    type: str
-    properties: dict = Field(default_factory=dict)
+EXTRACT_ENTITIES_PROMPT = """
+You are an advanced algorithm designed to extract structured information from text to construct knowledge graphs. Your goal is to capture comprehensive information while maintaining accuracy. Follow these key principles:
 
-GRAPH_EXTRACTION_PROMPT = [
-    (
-        "system",
-        (
-            "# Knowledge Graph Instructions\n"
-            "## 1. Overview\n"
-            "You are a top-tier algorithm designed for extracting information in structured "
-            "formats to build a knowledge graph.\n"
-            "Try to capture as much information from the text as possible without "
-            "sacrificing accuracy. Do not add any information that is not explicitly "
-            "mentioned in the text.\n"
-            "- **Nodes** represent entities and concepts.\n"
-            "- The aim is to achieve simplicity and clarity in the knowledge graph, making it\n"
-            "accessible for a vast audience.\n"
-            "## 2. Labeling Nodes\n"
-            "- **Consistency**: Ensure you use available types for node labels.\n"
-            "Ensure you use basic or elementary types for node labels.\n"
-            "- For example, when you identify an entity representing a person, "
-            "always label it as **'person'**. Avoid using more specific terms "
-            "like 'mathematician' or 'scientist'."
-            "- **Node IDs**: Never utilize integers as node IDs. Node IDs should be "
-            "names or human-readable identifiers found in the text.\n"
-            "- **Relationships** represent connections between entities or concepts.\n"
-            "Ensure consistency and generality in relationship types when constructing "
-            "knowledge graphs. Instead of using specific and momentary types "
-            "such as 'BECAME_PROFESSOR', use more general and timeless relationship types "
-            "like 'PROFESSOR'. Make sure to use general and timeless relationship types!\n"
-            "## 3. Coreference Resolution\n"
-            "- **Maintain Entity Consistency**: When extracting entities, it's vital to "
-            "ensure consistency.\n"
-            'If an entity, such as "John Doe", is mentioned multiple times in the text '
-            'but is referred to by different names or pronouns (e.g., "Joe", "he"),'
-            "always use the most complete identifier for that entity throughout the "
-            'knowledge graph. In this example, use "John Doe" as the entity ID.\n'
-            "Remember, the knowledge graph should be coherent and easily understandable, "
-            "so maintaining consistency in entity references is crucial.\n"
-            "## 4. Strict Compliance\n"
-            "Adhere to the rules strictly. Non-compliance will result in termination."
-        )
-    ),
-    (
-        "user",
-        (
-            "Tip: Make sure to answer in the correct format and do "
-            "not include any explanations. "
-            "Use the given format to extract information from the "
-            "following input: {input}"
-        ),
-    ),
-]
+1. Extract only explicitly stated information from the text.
+2. Identify nodes (entities/concepts), their types, and relationships.
+3. Use "USER_ID" as the source node for any self-references (I, me, my, etc.) in user messages.
+CUSTOM_PROMPT
 
-def map_to_base_node(node) -> Node:
-    properties = {}
-    if hasattr(node, "properties") and node.properties:
-        for p in node.properties:
-            properties[format_property_key(p.key)] = p.value
-    return Node(id=node.id, type=node.type, properties=properties)
+Nodes and Types:
+- Aim for simplicity and clarity in node representation.
+- Use basic, general types for node labels (e.g. "person" instead of "mathematician").
 
-def map_to_base_relationship(rel) -> Relationship:
-    source = Node(id=rel.source_node_id, type=rel.source_node_type)
-    target = Node(id=rel.target_node_id, type=rel.target_node_type)
-    properties = {}
-    if hasattr(rel, "properties") and rel.properties:
-        for p in rel.properties:
-            properties[format_property_key(p.key)] = p.value
-    return Relationship(source=source, target=target, type=rel.type, properties=properties)
+Relationships:
+- Use consistent, general, and timeless relationship types.
+- Example: Prefer "PROFESSOR" over "BECAME_PROFESSOR".
 
-def _format_nodes(nodes: list[Node]) -> list[Node]:
-    return [Node(
-        id=el.id.title() if isinstance(el.id, str) else el.id,
-        type=el.type.capitalize() if el.type else None,
-        properties=el.properties,
-    ) for el in nodes]
+Entity Consistency:
+- Use the most complete identifier for entities mentioned multiple times.
+- Example: Always use "John Doe" instead of variations like "Joe" or pronouns.
 
-def _format_relationships(rels: list[Relationship]) -> list[Relationship]:
-    return [Relationship(
-        source=_format_nodes([el.source])[0],
-        target=_format_nodes([el.target])[0],
-        type=el.type.replace(" ", "_").upper(),
-        properties=el.properties,
-    ) for el in rels]
+Strive for a coherent, easily understandable knowledge graph by maintaining consistency in entity references and relationship types.
 
-def format_property_key(s: str) -> str:
-    words = s.split()
-    if not words: return s
-    return "".join([words[0].lower()] + [word.capitalize() for word in words[1:]])
+Adhere strictly to these guidelines to ensure high-quality knowledge graph extraction."""
 
-class _Graph(BaseModel):
-    nodes: list | None
-    relationships: list | None
+UPDATE_GRAPH_PROMPT = """
+You are an AI expert specializing in graph memory management and optimization. Your task is to analyze existing graph memories alongside new information, and update the relationships in the memory list to ensure the most accurate, current, and coherent representation of knowledge.
 
-def _get_additional_info(input_type: str) -> str:
-    if input_type not in ["node", "relationship", "property"]:
-        raise ValueError("input_type must be 'node', 'relationship', or 'property'")
-    if input_type == "node":
-        return (
-            "Ensure you use basic or elementary types for node labels.\n"
-            "For example, when you identify an entity representing a person, "
-            "always label it as **'Person'**. Avoid using more specific terms "
-            "like 'Mathematician' or 'Scientist'"
-        )
-    elif input_type == "relationship":
-        return (
-            "Instead of using specific and momentary types such as "
-            "'BECAME_PROFESSOR', use more general and timeless relationship types "
-            "like 'PROFESSOR'. However, do not sacrifice any accuracy for generality"
-        )
-    return ""
+Input:
+1. Existing Graph Memories: A list of current graph memories, each containing source, target, and relationship information.
+2. New Graph Memory: Fresh information to be integrated into the existing graph structure.
 
-def optional_enum_field(enum: list[str] | None, description: str = "", input_type: str = "node", **field_kwargs):
-    if enum:
-        return Field(
-            ...,
-            enum=enum,
-            description=f"{description}. Available options are {enum}",
-            **field_kwargs,
-        )
-    return Field(..., description=description + _get_additional_info(input_type), **field_kwargs)
+Guidelines:
+1. Identification: Use the source and target as primary identifiers when matching existing memories with new information.
+2. Conflict Resolution:
+   - If new information contradicts an existing memory:
+     a) For matching source and target but differing content, update the relationship of the existing memory.
+     b) If the new memory provides more recent or accurate information, update the existing memory accordingly.
+3. Comprehensive Review: Thoroughly examine each existing graph memory against the new information, updating relationships as necessary. Multiple updates may be required.
+4. Consistency: Maintain a uniform and clear style across all memories. Each entry should be concise yet comprehensive.
+5. Semantic Coherence: Ensure that updates maintain or improve the overall semantic structure of the graph.
+6. Temporal Awareness: If timestamps are available, consider the recency of information when making updates.
+7. Relationship Refinement: Look for opportunities to refine relationship descriptions for greater precision or clarity.
+8. Redundancy Elimination: Identify and merge any redundant or highly similar relationships that may result from the update.
 
-def create_simple_model(
-    node_labels: list[str] | None = None,
-    rel_types: list[str] | None = None,
-    node_properties: bool | list[str] = False,
-    relationship_properties: bool | list[str] = False,
-) -> type[_Graph]:
-    node_fields = {
-        "id": (str, Field(..., description="Name or human-readable unique identifier.")),
-        "type": (str, optional_enum_field(
-            node_labels,
-            description="The type or label of the node.",
-            input_type="node",
-        ))
-    }
-    if node_properties:
-        if isinstance(node_properties, list) and "id" in node_properties:
-            raise ValueError("The node property 'id' is reserved and cannot be used.")
-        
-        class Property(BaseModel):
-            """A single property consisting of key and value"""
-            key: str = optional_enum_field(
-                [] if node_properties is True else node_properties,
-                description="Property key.",
-                input_type="property",
-            )
-            value: str = Field(..., description="value")
+Task Details:
+- Existing Graph Memories:
+{existing_memories}
 
-        node_fields["properties"] = (list[Property] | None, Field(None, description="List of node properties"))
+- New Graph Memory: {memory}
+
+Output:
+Provide a list of update instructions, each specifying the source, target, and the new relationship to be set. Only include memories that require updates.
+"""
+
+class Search(BaseModel):
+    entities: list[str] = Field(..., description="List of entities to search for.")
+    relations: list[str] = Field(..., description="List of relations to search for.")
+
+class Relation(BaseModel):
+    source_node: str = Field(..., description="The identifier of the source node in the relationship.")
+    source_type: str = Field(..., description="The type or category of the source node.")
+    relationship: str = Field(..., description="The type of relationship between the source and target nodes.")
+    target_node: str = Field(..., description="The identifier of the target node in the relationship.")
+    target_type: str = Field(..., description="The type or category of the target node.")
+
+class Entities(BaseModel):
+    entities: list[Relation] = Field(..., description="Add new entities and relationships to the graph based on the provided query.")
+
+class Update(BaseModel):
+    source_node: str = Field(..., description="The identifier of the source node in the relationship to be updated.")
+    target_node: str = Field(..., description="The identifier of the target node in the relationship to be updated.")
+    relationship: str = Field(..., description="The new or updated relationship between the source and target nodes.")
+
+class GraphMutations(BaseModel):
+    additions: list[Relation] = Field(..., description="List of new relationships to be added to the graph. Add a new graph memories to the knowledge graph. Each item creates a new relationship between two nodes, potentially creating new nodes if they don't exist.")
+    updates: list[Update] = Field(..., description="List of relationships to be updated in the graph. Each item updates the relationship key of an existing graph memory based on new information. Updates should only be performed if the new information is more recent, more accurate, or provides additional context compared to the existing information. The source and destination nodes of the relationship must remain the same as in the existing graph memory; only the relationship itself can be updated.")
+
+def normalize(text: str) -> str:
+    return text.strip(" _").lower().replace(" ", "_").replace("'", "").replace('"', "").replace(",", "").replace("'", "").replace(";", "").replace("\n", "").removeprefix("the_").removeprefix("a_")
+
+class KnowledgeGraph:
+    def __init__(self, llm, db: chromadb.ClientAPI, model: str = "gpt-4o-mini"):
+        self.nodes = db.get_or_create_collection(name="nodes", metadata={"hnsw:space": "cosine"})
+        self.relations = db.get_or_create_collection(name="relations", metadata={"hnsw:space": "cosine"})
+        self.model = model
+        self.user_id = "USER"
+        self.custom_prompt = None
+        self.client = llm
     
-    relationship_fields = {
-        "source_node_id": (str, Field(..., description="Name or human-readable unique identifier of source node")),
-        "source_node_type": (str, optional_enum_field(
-            node_labels,
-            description="The type or label of the source node.",
-            input_type="node"
-        )),
-        "target_node_id": (str, Field(..., description="Name or human-readable unique identifier of target node")),
-        "target_node_type": (str, optional_enum_field(
-            node_labels,
-            description="The type or label of the target node.",
-            input_type="node"
-        )),
-        "type": (str, optional_enum_field(
-            rel_types,
-            description="The type of the relationship.",
-            input_type="relationship"
-        ))
-    }
-    if relationship_properties:
-        if isinstance(relationship_properties, list) and "id" in relationship_properties:
-            raise ValueError("The relationship property 'id' is reserved and cannot be used.")
-
-        class RelationshipProperty(BaseModel):
-            """A single property consisting of key and value"""
-            key: str = optional_enum_field(
-                [] if relationship_properties is True else relationship_properties,
-                description="Property key.",
-                input_type="property",
-            )
-            value: str = Field(..., description="value")
-
-        relationship_fields["properties"] = (
-            list[RelationshipProperty] | None,
-            Field(None, description="List of relationship properties"),
+    async def add(self, data: str, filters: dict = {}):
+        new_memory: Entities = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": EXTRACT_ENTITIES_PROMPT.replace("USER_ID", self.user_id).replace("CUSTOM_PROMPT", f"4. {self.custom_prompt}") if self.custom_prompt else ""},
+                {"role": "user", "content": data},
+            ],
+            response_model=Entities,
+            max_retries=2,
         )
+        if not new_memory.entities:
+            return []
+        
+        search_output = "\n".join([
+            json.dumps({"source": entity["source"], "relation": entity["relation"], "destination": entity["destination"]})
+            for entity in await self.search(data)])
+        
+        response: GraphMutations = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": UPDATE_GRAPH_PROMPT.format(existing_memories=search_output, memory=new_memory)}],
+            response_model=GraphMutations,
+            max_retries=2,
+        )
+        to_be_added = response.additions + response.updates
+        to_delete = [{"$and": [
+                {"source": normalize(item.source_node)},
+                {"destination": normalize(item.target_node)}]}
+                for item in response.updates]
+        node_ids, node_metadatas, node_documents = [], [], []
+        rel_ids, rel_metadatas, rel_documents = [], [], []
+        returned_entities = []
+        for item in to_be_added:
+            source = normalize(item.source_node)
+            relation = normalize(item.relationship)
+            target = normalize(item.target_node)
+            rel_id = f"{source}_{relation}_{target}"
+            returned_entities.append({"source": source, "relationship": relation, "target": target})
+            for node in [source, target]:
+                if node not in node_ids:
+                    node_ids.append(node)
+                    node_documents.append(node)
+                    metadata = {"name": node, **filters}
+                    if node == target and isinstance(item, Relation):
+                        metadata["type"] = normalize(item.target_type)
+                    elif node == source and isinstance(item, Relation):
+                        metadata["type"] = normalize(item.source_type)
+                    node_metadatas.append(metadata)
+            if rel_id not in rel_ids:
+                rel_ids.append(rel_id)
+                rel_metadatas.append({"source": source, "destination": target, "relation": relation, **filters})
+                rel_documents.append(f"{item.source_node} {item.relationship.lower().replace('_', ' ')} {item.target_node}")
+        
+        if to_delete: self.relations.delete(where={"$or": to_delete} if len(to_delete) > 1 else to_delete[0])
+        if node_ids: self.nodes.upsert(node_ids, None, node_metadatas, node_documents)
+        if rel_ids: self.relations.upsert(rel_ids, None, rel_metadatas, rel_documents)
+        return returned_entities
 
-    class DynamicGraph(_Graph):
-        """Represents a graph document consisting of nodes and relationships."""
-        nodes: list[create_model("SimpleNode", **node_fields)] | None = Field(description="List of nodes")  # type: ignore
-        relationships: list[create_model("SimpleRelationship", **relationship_fields)] | None = Field(description="List of relationships")  # type: ignore
+    async def search(self, query: str, filters: dict = {}, limit: int = 100, threshold: float = 0.7):
+        response: Search = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"You are a smart assistant who understands the entities, their types, and relations in a given text. If user message contains self reference such as 'I', 'me', 'my' etc. then use {self.user_id} as the source node. Extract the entities. ***DO NOT*** answer the question itself if the given text is a question.",
+                },
+                {"role": "user", "content": query},
+            ],
+            response_model=Search,
+            max_retries=2,
+        )
+        nodes = [normalize(node) for node in set(response.entities)]
+        if not nodes:
+            return []
+        
+        nodes = self.nodes.query(query_texts=nodes, where=filters, n_results=1)
+        print(nodes)
+        nodes = list(set([n[0]["name"] for d, n in zip(nodes["distances"], nodes["metadatas"]) if d[0] < threshold]))
+        if not nodes:
+            return []
+        
+        results = self.relations.query(
+            query_texts=[query],
+            where={"$or": [{"source": {"$in": nodes}}, {"destination": {"$in": nodes}}]},
+            n_results=limit
+        )
+        return [r for m in results["metadatas"] for r in m]
 
-    return DynamicGraph
+    async def delete_all(self, filters=None):
+        self.nodes.delete(where=filters)
+        self.relations.delete(where=filters)
+    
+    async def get_node(self, node: str):
+        return {
+            **self.nodes.get(where={"name": node})["metadatas"],
+            "to": self.relations.get(where={"source": node})["metadatas"],
+            "from": self.relations.get(where={"destination": node})["metadatas"],
+            "close": self.relations.query(query_texts=[node], n_results=10)["metadatas"][1:],
+        }
 
-async def extract_graph(
-    text: str,
-    model: str = "gpt-4o-mini",
-    allowed_nodes: list[str] = [],
-    allowed_relationships: list[str] = [],
-    node_properties: bool | list[str] = False,
-    relationship_properties: bool | list[str] = False,
-    **kwargs,
-) -> tuple[list[Node], list[Relationship]]:
-    schema = create_simple_model(allowed_nodes, allowed_relationships, node_properties, relationship_properties)
-    messages = [{"role": m[0], "content": m[1].format(input=text)} for m in GRAPH_EXTRACTION_PROMPT]
-    response = await litellm.acompletion(model, messages, response_format=schema, **kwargs)
-    parsed_schema: _Graph = schema.model_validate_json(response.choices[0].message.content)
-    return (
-        _format_nodes([
-                map_to_base_node(node)
-                for node in parsed_schema.nodes
-                if node.id
-            ]
-            if parsed_schema.nodes else []),
-        _format_relationships([
-                map_to_base_relationship(rel)
-                for rel in parsed_schema.relationships
-                if rel.type and rel.source_node_id and rel.target_node_id
-            ]
-            if parsed_schema.relationships else [])
-    )
+    async def get_all(self, filters=None, limit=None):
+        return self.relations.get(where=filters, limit=limit)["metadatas"]
+
+    async def get_all_nodes(self, filters=None, limit=None):
+        return self.nodes.get(where=filters, limit=limit)["metadatas"]
+    
+    async def get_relation(self, relation: str, offset=None, limit=None):
+        return self.relations.get(where={"relation": relation}, offset=offset, limit=limit)["metadatas"]
+    
+    async def get_type(self, type: str, offset=None, limit=None):
+        return self.nodes.get(where={"type": type}, offset=offset, limit=limit)["metadatas"]
+
+    async def dump(self):
+        return {
+            "nodes": self.nodes.get(include=["metadatas"])["metadatas"],
+            "relations": self.relations.get(include=["metadatas"])["metadatas"],
+        }
+    
+    async def load(self, data):
+        node_ids = [node["name"] for node in data["nodes"]]
+        node_documents = [node["name"].replace("_", " ") for node in data["nodes"]]
+        rel_ids = [f"{rel['source']}_{rel['relation']}_{rel['destination']}" for rel in data["relations"]]
+        rel_documents = [
+            f"{rel['source'].replace('_', ' ')} {rel['relation'].replace('_', ' ')} {rel['destination'].replace('_', ' ')}"
+            for rel in data["relations"]]
+        if node_ids: self.nodes.upsert(node_ids, None, data["node"], node_documents)
+        if rel_ids: self.relations.upsert(rel_ids, None, data["relations"], rel_documents)
+
+    async def merge_nodes(self, node1: str, node2: str):
+        self.nodes.delete(where={"name": node2})
+        rel = self.relations.get(where={"$or": [{"source": node2}, {"destination": node2}]}, include=["metadatas"])
+        if not rel["metadatas"]:
+            print(f"No relations found for node {node2}.")
+            return
+        for r in rel["metadatas"]:
+            if r["source"] == node2:
+                r["source"] = node1
+            if r["destination"] == node2:
+                r["destination"] = node1
+        ids = [f"{r['source']}_{r['relation']}_{r['destination']}" for r in rel["metadatas"]]
+        documents = [f"{r['source'].replace('_', ' ')} {r['relation'].replace('_', ' ')} {r['destination'].replace('_', ' ')}" for r in rel["metadatas"]]
+        self.relations.upsert(ids, None, rel["metadatas"], documents)
+        self.relations.delete(where={"$or": [{"source": node2}, {"destination": node2}]})
+
+    async def remove_node(self, node: str):
+        self.relations.delete(where={"$or": [{"source": node}, {"destination": node}]})
+        self.nodes.delete(where={"name": node})
+        self.nodes.delete(ids=[node])
+
+    async def get_graph(self):
+        import networkx as nx
+
+        relations = await self.get_all()
+        nodes = set([r["source"] for r in relations] + [r["destination"] for r in relations])
+        G = nx.MultiDiGraph()
+        for n in nodes:
+            G.add_node(n)
+        for r in relations:
+            G.add_edge(r["source"], r["destination"], relation=r["relation"])
+        return G
